@@ -1,0 +1,12 @@
+# Состав системы, пока один сервис
+
+services:
+  gateway:
+    build:
+      # контекст - корень проекта, там лежит go.mod
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    image: evcharge/gateway:1.0
+    container_name: evcharge-gateway
+    ports:
+      - "8080:8080"

@@ -1,0 +1,22 @@
+# Скомпилированные бинарники
+/bin/
+*.exe
+*.exe~
+*.out
+
+# Локальные настройки окружения
+.env
+.env.local
+
+# Редакторы и IDE
+.idea/
+.vscode/
+*.swp
+
+# Служебные файлы Windows / macOS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Данные контейнеров, которые монтируются томами
+/.data/
