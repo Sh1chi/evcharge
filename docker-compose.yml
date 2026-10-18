@@ -30,6 +30,18 @@ services:
       timeout: 5s
       retries: 10
 
+  stations:
+    build:
+      context: .
+      dockerfile: services/stations/Dockerfile
+    image: evcharge/stations:2.0
+    container_name: evcharge-stations
+    environment:
+      AMQP_URL: amqp://evcharge:evcharge@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   gateway:
     build:
       # контекст - корень проекта, там лежит go.mod
