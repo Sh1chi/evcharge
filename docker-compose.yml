@@ -1,6 +1,35 @@
-# Состав системы, пока один сервис
+# Состав системы
 
 services:
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    container_name: evcharge-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: evcharge
+      RABBITMQ_DEFAULT_PASS: evcharge
+    ports:
+      - "15672:15672"   # веб-интерфейс
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:18
+    container_name: evcharge-postgres
+    environment:
+      POSTGRES_USER: evcharge
+      POSTGRES_PASSWORD: evcharge
+      POSTGRES_DB: evcharge
+    ports:
+      - "5432:5432"     # для pgAdmin
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "evcharge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   gateway:
     build:
       # контекст - корень проекта, там лежит go.mod
