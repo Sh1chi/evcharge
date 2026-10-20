@@ -4,6 +4,7 @@
 общаются через RabbitMQ:
 
 - gateway - HTTP-вход
+- sessions - сессии зарядки, хранит их в PostgreSQL
 - stations - станции
 
 ## Запуск
