@@ -3,8 +3,8 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /src
 
-# go.mod отдельным слоем, чтобы правка кода не сбрасывала кэш зависимостей
-COPY go.mod ./
+# go.mod и go.sum отдельным слоем, чтобы правка кода не сбрасывала кэш зависимостей
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
