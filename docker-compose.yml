@@ -24,6 +24,9 @@ services:
       POSTGRES_DB: evcharge
     ports:
       - "5432:5432"     # для pgAdmin
+    volumes:
+      # таблица станций создаётся при создании базы
+      - ./services/stations/stations.sql:/docker-entrypoint-initdb.d/stations.sql
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "evcharge"]
       interval: 5s
@@ -49,12 +52,15 @@ services:
     build:
       context: .
       dockerfile: services/stations/Dockerfile
-    image: evcharge/stations:2.0
+    image: evcharge/stations:3.0
     container_name: evcharge-stations
     environment:
       AMQP_URL: amqp://evcharge:evcharge@rabbitmq:5672/
+      DATABASE_URL: postgres://evcharge:evcharge@postgres:5432/evcharge
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   gateway:
