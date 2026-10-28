@@ -10,7 +10,7 @@ services:
     ports:
       - "15672:15672"   # веб-интерфейс
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -28,7 +28,7 @@ services:
       # таблица станций создаётся при создании базы
       - ./services/stations/stations.sql:/docker-entrypoint-initdb.d/stations.sql
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "evcharge"]
+      test: ["CMD", "pg_isready", "-h", "localhost", "-U", "evcharge"]
       interval: 5s
       timeout: 5s
       retries: 10
