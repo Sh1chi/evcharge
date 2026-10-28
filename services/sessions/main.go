@@ -37,6 +37,13 @@ type findRequest struct {
 	PowerKW   float64 `json:"power_kw"`
 }
 
+// ответ stations на поиск станции
+type findResponse struct {
+	SessionID int64  `json:"session_id"`
+	StationID int64  `json:"station_id"`
+	Error     string `json:"error"`
+}
+
 const createTable = `
 CREATE TABLE IF NOT EXISTS sessions (
 	id         BIGSERIAL PRIMARY KEY,
@@ -53,6 +60,12 @@ const insertSession = `
 INSERT INTO sessions (lat, lon, connector, power_kw, status)
 VALUES ($1, $2, $3, $4, 'searching')
 RETURNING id`
+
+const setStation = `
+UPDATE sessions SET station_id = $1, status = 'assigned' WHERE id = $2`
+
+const setNotFound = `
+UPDATE sessions SET status = 'not_found' WHERE id = $1`
 
 func main() {
 	db, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
@@ -89,6 +102,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// сюда stations присылает найденную станцию
+	_, err = ch.QueueDeclare("sessions.assign", true, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// не больше одного неподтверждённого сообщения за раз
 	err = ch.Qos(1, 0, false)
 	if err != nil {
@@ -100,26 +119,27 @@ func main() {
 		log.Fatal(err)
 	}
 
+	found, err := ch.Consume("sessions.assign", "", false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// обе очереди читаются в одной горутине, подключение к базе одно
 	go func() {
-		for d := range msgs {
-			resp := createSession(db, ch, d.Body)
-
-			body, _ := json.Marshal(resp)
-			reply := amqp.Publishing{
-				ContentType:   "application/json",
-				CorrelationId: d.CorrelationId,
-				Body:          body,
+		for {
+			select {
+			case d, ok := <-msgs:
+				if !ok {
+					return
+				}
+				replySession(db, ch, d)
+			case d, ok := <-found:
+				if !ok {
+					return
+				}
+				assignStation(db, d.Body)
+				d.Ack(false)
 			}
-
-			// ответ уходит в очередь, которую gateway указал в reply_to
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := ch.PublishWithContext(ctx, "", d.ReplyTo, false, false, reply)
-			cancel()
-			if err != nil {
-				log.Println("не удалось отправить ответ:", err)
-			}
-
-			d.Ack(false)
 		}
 	}()
 
@@ -131,6 +151,28 @@ func main() {
 	<-quit
 
 	log.Println("получен сигнал завершения, сервис остановлен")
+}
+
+// создаёт сессию и отвечает gateway
+func replySession(db *pgx.Conn, ch *amqp.Channel, d amqp.Delivery) {
+	resp := createSession(db, ch, d.Body)
+
+	body, _ := json.Marshal(resp)
+	reply := amqp.Publishing{
+		ContentType:   "application/json",
+		CorrelationId: d.CorrelationId,
+		Body:          body,
+	}
+
+	// ответ уходит в очередь, которую gateway указал в reply_to
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := ch.PublishWithContext(ctx, "", d.ReplyTo, false, false, reply)
+	cancel()
+	if err != nil {
+		log.Println("не удалось отправить ответ:", err)
+	}
+
+	d.Ack(false)
 }
 
 // записывает сессию в базу и отправляет запрос на поиск станции
@@ -162,6 +204,7 @@ func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) createResponse {
 	findBody, _ := json.Marshal(find)
 	msg := amqp.Publishing{
 		ContentType: "application/json",
+		ReplyTo:     "sessions.assign",
 		Body:        findBody,
 	}
 
@@ -173,4 +216,32 @@ func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) createResponse {
 	}
 
 	return createResponse{SessionID: id, Status: "searching"}
+}
+
+// записывает в сессию найденную станцию или статус not_found
+func assignStation(db *pgx.Conn, body []byte) {
+	var resp findResponse
+	err := json.Unmarshal(body, &resp)
+	if err != nil {
+		log.Println("не удалось разобрать сообщение:", err)
+		return
+	}
+
+	if resp.Error != "" {
+		_, err = db.Exec(context.Background(), setNotFound, resp.SessionID)
+	} else {
+		_, err = db.Exec(context.Background(), setStation,
+			resp.StationID, resp.SessionID)
+	}
+	if err != nil {
+		log.Println("не удалось обновить сессию:", err)
+		return
+	}
+
+	if resp.Error != "" {
+		log.Printf("сессия %d: станция не найдена", resp.SessionID)
+	} else {
+		log.Printf("сессия %d: назначена станция %d",
+			resp.SessionID, resp.StationID)
+	}
 }

@@ -37,7 +37,7 @@ services:
     build:
       context: .
       dockerfile: services/sessions/Dockerfile
-    image: evcharge/sessions:2.0
+    image: evcharge/sessions:3.0
     container_name: evcharge-sessions
     environment:
       AMQP_URL: amqp://evcharge:evcharge@rabbitmq:5672/
