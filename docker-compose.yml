@@ -9,6 +9,7 @@ services:
       RABBITMQ_DEFAULT_PASS: evcharge
     ports:
       - "15672:15672"   # веб-интерфейс
+      - "5672:5672"     # для тестов
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s

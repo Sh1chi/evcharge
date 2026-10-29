@@ -22,3 +22,12 @@ POST http://localhost:8080/api/v1/sessions
 ```
 
 Веб-интерфейс RabbitMQ: `http://localhost:15672`, логин и пароль `evcharge`
+
+## Тесты
+
+Тесты отправляют запросы в stations через RabbitMQ, перед запуском
+система должна быть поднята:
+
+```
+go test -v ./services/stations
+```
