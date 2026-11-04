@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -21,10 +22,16 @@ type createRequest struct {
 	PowerKW   float64 `json:"power_kw"`
 }
 
-// ответ gateway
-type createResponse struct {
+// запрос по номеру сессии: просмотр и завершение
+type idRequest struct {
+	SessionID int64 `json:"session_id"`
+}
+
+// ответ gateway на все запросы
+type sessionResponse struct {
 	SessionID int64  `json:"session_id"`
-	Status    string `json:"status"`
+	Status    string `json:"status,omitempty"`
+	StationID int64  `json:"station_id,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
@@ -67,6 +74,15 @@ UPDATE sessions SET station_id = $1, status = 'assigned' WHERE id = $2`
 const setNotFound = `
 UPDATE sessions SET status = 'not_found' WHERE id = $1`
 
+const selectSession = `
+SELECT status, station_id FROM sessions WHERE id = $1`
+
+// завершить можно только сессию с назначенной станцией
+const setFinished = `
+UPDATE sessions SET status = 'finished'
+WHERE id = $1 AND status = 'assigned'
+RETURNING station_id`
+
 func main() {
 	db, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -108,6 +124,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	_, err = ch.QueueDeclare("sessions.get", true, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = ch.QueueDeclare("sessions.finish", true, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// не больше одного неподтверждённого сообщения за раз
 	err = ch.Qos(1, 0, false)
 	if err != nil {
@@ -124,7 +150,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// обе очереди читаются в одной горутине, подключение к базе одно
+	gets, err := ch.Consume("sessions.get", "", false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	finishes, err := ch.Consume("sessions.finish", "",
+		false, false, false, false, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// все очереди читаются в одной горутине, подключение к базе одно
 	go func() {
 		for {
 			select {
@@ -132,7 +169,17 @@ func main() {
 				if !ok {
 					return
 				}
-				replySession(db, ch, d)
+				reply(ch, d, createSession(db, ch, d.Body))
+			case d, ok := <-gets:
+				if !ok {
+					return
+				}
+				reply(ch, d, getSession(db, d.Body))
+			case d, ok := <-finishes:
+				if !ok {
+					return
+				}
+				reply(ch, d, finishSession(db, d.Body))
 			case d, ok := <-found:
 				if !ok {
 					return
@@ -153,10 +200,8 @@ func main() {
 	log.Println("получен сигнал завершения, сервис остановлен")
 }
 
-// создаёт сессию и отвечает gateway
-func replySession(db *pgx.Conn, ch *amqp.Channel, d amqp.Delivery) {
-	resp := createSession(db, ch, d.Body)
-
+// отправляет ответ gateway и подтверждает сообщение
+func reply(ch *amqp.Channel, d amqp.Delivery, resp sessionResponse) {
 	body, _ := json.Marshal(resp)
 	reply := amqp.Publishing{
 		ContentType:   "application/json",
@@ -176,12 +221,12 @@ func replySession(db *pgx.Conn, ch *amqp.Channel, d amqp.Delivery) {
 }
 
 // записывает сессию в базу и отправляет запрос на поиск станции
-func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) createResponse {
+func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) sessionResponse {
 	var req createRequest
 	err := json.Unmarshal(body, &req)
 	if err != nil {
 		log.Println("не удалось разобрать сообщение:", err)
-		return createResponse{Error: "неверный формат запроса"}
+		return sessionResponse{Error: "неверный формат запроса"}
 	}
 
 	var id int64
@@ -190,7 +235,7 @@ func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) createResponse {
 	err = row.Scan(&id)
 	if err != nil {
 		log.Println("не удалось записать сессию:", err)
-		return createResponse{Error: "не удалось создать сессию"}
+		return sessionResponse{Error: "не удалось создать сессию"}
 	}
 	log.Println("создана сессия", id)
 
@@ -215,7 +260,7 @@ func createSession(db *pgx.Conn, ch *amqp.Channel, body []byte) createResponse {
 		log.Println("не удалось отправить запрос в stations:", err)
 	}
 
-	return createResponse{SessionID: id, Status: "searching"}
+	return sessionResponse{SessionID: id, Status: "searching"}
 }
 
 // записывает в сессию найденную станцию или статус not_found
@@ -244,4 +289,63 @@ func assignStation(db *pgx.Conn, body []byte) {
 		log.Printf("сессия %d: назначена станция %d",
 			resp.SessionID, resp.StationID)
 	}
+}
+
+// возвращает статус сессии и назначенную станцию
+func getSession(db *pgx.Conn, body []byte) sessionResponse {
+	var req idRequest
+	err := json.Unmarshal(body, &req)
+	if err != nil {
+		log.Println("не удалось разобрать сообщение:", err)
+		return sessionResponse{Error: "неверный формат запроса"}
+	}
+
+	resp := sessionResponse{SessionID: req.SessionID}
+
+	// пока станция не найдена, station_id в базе NULL
+	var stationID *int64
+	row := db.QueryRow(context.Background(), selectSession, req.SessionID)
+	err = row.Scan(&resp.Status, &stationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		resp.Error = "сессия не найдена"
+		return resp
+	}
+	if err != nil {
+		log.Println("не удалось прочитать сессию:", err)
+		resp.Error = "не удалось получить сессию"
+		return resp
+	}
+
+	if stationID != nil {
+		resp.StationID = *stationID
+	}
+	return resp
+}
+
+// переводит сессию в статус finished
+func finishSession(db *pgx.Conn, body []byte) sessionResponse {
+	var req idRequest
+	err := json.Unmarshal(body, &req)
+	if err != nil {
+		log.Println("не удалось разобрать сообщение:", err)
+		return sessionResponse{Error: "неверный формат запроса"}
+	}
+
+	resp := sessionResponse{SessionID: req.SessionID}
+
+	row := db.QueryRow(context.Background(), setFinished, req.SessionID)
+	err = row.Scan(&resp.StationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		resp.Error = "сессия не найдена или станция не назначена"
+		return resp
+	}
+	if err != nil {
+		log.Println("не удалось завершить сессию:", err)
+		resp.Error = "не удалось завершить сессию"
+		return resp
+	}
+
+	resp.Status = "finished"
+	log.Printf("сессия %d завершена", req.SessionID)
+	return resp
 }
