@@ -69,7 +69,7 @@ services:
       # контекст - корень проекта, там лежит go.mod
       context: .
       dockerfile: services/gateway/Dockerfile
-    image: evcharge/gateway:2.0
+    image: evcharge/gateway:4.0
     container_name: evcharge-gateway
     environment:
       AMQP_URL: amqp://evcharge:evcharge@rabbitmq:5672/
