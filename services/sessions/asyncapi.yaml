@@ -1,0 +1,234 @@
+asyncapi: 3.0.0
+info:
+  title: sessions
+  version: 4.0.0
+  description: Создание, просмотр и завершение сессий зарядки
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: rabbitmq:5672
+    protocol: amqp
+    protocolVersion: 0.9.1
+
+channels:
+  sessionsCreate:
+    address: sessions.create
+    messages:
+      createRequest:
+        $ref: '#/components/messages/createRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: sessions.create
+          durable: true
+  sessionsGet:
+    address: sessions.get
+    messages:
+      idRequest:
+        $ref: '#/components/messages/idRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: sessions.get
+          durable: true
+  sessionsFinish:
+    address: sessions.finish
+    messages:
+      idRequest:
+        $ref: '#/components/messages/idRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: sessions.finish
+          durable: true
+  reply:
+    address: null
+    description: Очередь, которую отправитель указал в reply_to
+    messages:
+      sessionResponse:
+        $ref: '#/components/messages/sessionResponse'
+  stationsFind:
+    address: stations.find
+    messages:
+      findRequest:
+        $ref: '#/components/messages/findRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: stations.find
+          durable: true
+  sessionsAssign:
+    address: sessions.assign
+    description: Сюда stations присылает найденную станцию
+    messages:
+      findResponse:
+        $ref: '#/components/messages/findResponse'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: sessions.assign
+          durable: true
+
+operations:
+  createSession:
+    action: receive
+    channel:
+      $ref: '#/channels/sessionsCreate'
+    summary: Создать сессию со статусом searching и запустить поиск станции
+    messages:
+      - $ref: '#/channels/sessionsCreate/messages/createRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  getSession:
+    action: receive
+    channel:
+      $ref: '#/channels/sessionsGet'
+    summary: Отдать статус сессии и назначенную станцию
+    messages:
+      - $ref: '#/channels/sessionsGet/messages/idRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  finishSession:
+    action: receive
+    channel:
+      $ref: '#/channels/sessionsFinish'
+    summary: Завершить сессию с назначенной станцией
+    messages:
+      - $ref: '#/channels/sessionsFinish/messages/idRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  findStation:
+    action: send
+    channel:
+      $ref: '#/channels/stationsFind'
+    summary: Запросить поиск станции, ответ придёт в sessions.assign
+    messages:
+      - $ref: '#/channels/stationsFind/messages/findRequest'
+    reply:
+      channel:
+        $ref: '#/channels/sessionsAssign'
+      messages:
+        - $ref: '#/channels/sessionsAssign/messages/findResponse'
+
+components:
+  replyAddresses:
+    replyTo:
+      description: Свойство reply_to сообщения AMQP
+      location: $message.header#/replyTo
+
+  correlationIds:
+    correlationId:
+      description: Свойство correlation_id сообщения AMQP
+      location: $message.header#/correlationId
+
+  messages:
+    createRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/createRequest'
+    idRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/idRequest'
+    sessionResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/sessionResponse'
+    findRequest:
+      payload:
+        $ref: '#/components/schemas/findRequest'
+    findResponse:
+      payload:
+        $ref: '#/components/schemas/findResponse'
+
+  schemas:
+    connector:
+      type: string
+      enum: [CCS2, Type2, CHAdeMO]
+
+    createRequest:
+      type: object
+      required: [lat, lon, connector, power_kw]
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+          description: Минимальная мощность станции, кВт
+    idRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: integer
+    sessionResponse:
+      type: object
+      properties:
+        session_id:
+          type: integer
+        status:
+          type: string
+          enum: [searching, assigned, not_found, finished]
+        station_id:
+          type: integer
+          description: Есть, только если станция назначена
+        error:
+          type: string
+
+    findRequest:
+      type: object
+      required: [session_id, lat, lon, connector, power_kw]
+      properties:
+        session_id:
+          type: integer
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+    findResponse:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: integer
+        station_id:
+          type: integer
+        name:
+          type: string
+        distance_km:
+          type: number
+        error:
+          type: string
+          description: Есть, только если станция не найдена

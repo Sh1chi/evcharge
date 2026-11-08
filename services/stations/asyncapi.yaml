@@ -1,0 +1,237 @@
+asyncapi: 3.0.0
+info:
+  title: stations
+  version: 4.0.0
+  description: Поиск ближайшей станции, список станций и смена их статуса
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: rabbitmq:5672
+    protocol: amqp
+    protocolVersion: 0.9.1
+
+channels:
+  stationsFind:
+    address: stations.find
+    messages:
+      findRequest:
+        $ref: '#/components/messages/findRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: stations.find
+          durable: true
+  stationsList:
+    address: stations.list
+    messages:
+      listRequest:
+        $ref: '#/components/messages/listRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: stations.list
+          durable: true
+  stationsStatus:
+    address: stations.status
+    messages:
+      statusRequest:
+        $ref: '#/components/messages/statusRequest'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          name: stations.status
+          durable: true
+  reply:
+    address: null
+    description: Очередь, которую отправитель указал в reply_to
+    messages:
+      findResponse:
+        $ref: '#/components/messages/findResponse'
+      listResponse:
+        $ref: '#/components/messages/listResponse'
+      statusResponse:
+        $ref: '#/components/messages/statusResponse'
+
+operations:
+  findStation:
+    action: receive
+    channel:
+      $ref: '#/channels/stationsFind'
+    summary: Найти ближайшую свободную станцию с нужным разъёмом и мощностью
+    messages:
+      - $ref: '#/channels/stationsFind/messages/findRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/findResponse'
+  listStations:
+    action: receive
+    channel:
+      $ref: '#/channels/stationsList'
+    summary: Отдать список станций, все или с нужным разъёмом
+    messages:
+      - $ref: '#/channels/stationsList/messages/listRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/listResponse'
+  setStatus:
+    action: receive
+    channel:
+      $ref: '#/channels/stationsStatus'
+    summary: Отметить станцию свободной или занятой
+    messages:
+      - $ref: '#/channels/stationsStatus/messages/statusRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/statusResponse'
+
+components:
+  replyAddresses:
+    replyTo:
+      description: Свойство reply_to сообщения AMQP
+      location: $message.header#/replyTo
+
+  correlationIds:
+    correlationId:
+      description: Свойство correlation_id сообщения AMQP
+      location: $message.header#/correlationId
+
+  messages:
+    findRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/findRequest'
+    findResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/findResponse'
+    listRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/listRequest'
+    listResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/listResponse'
+    statusRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/statusRequest'
+    statusResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/statusResponse'
+
+  schemas:
+    connector:
+      type: string
+      enum: [CCS2, Type2, CHAdeMO]
+    stationStatus:
+      type: string
+      enum: [free, busy]
+
+    findRequest:
+      type: object
+      required: [session_id, lat, lon, connector, power_kw]
+      properties:
+        session_id:
+          type: integer
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+          description: Минимальная мощность станции, кВт
+    findResponse:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: integer
+        station_id:
+          type: integer
+        name:
+          type: string
+        distance_km:
+          type: number
+        error:
+          type: string
+          description: Есть, только если станция не найдена
+
+    listRequest:
+      type: object
+      properties:
+        connector:
+          type: string
+          description: Пустая строка или отсутствие поля - все станции
+    station:
+      type: object
+      required: [id, name, lat, lon, connector, power_kw, status]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+        status:
+          $ref: '#/components/schemas/stationStatus'
+    listResponse:
+      type: object
+      required: [stations]
+      properties:
+        stations:
+          type: array
+          items:
+            $ref: '#/components/schemas/station'
+        error:
+          type: string
+
+    statusRequest:
+      type: object
+      required: [station_id, status]
+      properties:
+        station_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/stationStatus'
+    statusResponse:
+      type: object
+      required: [station_id]
+      properties:
+        station_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/stationStatus'
+        error:
+          type: string

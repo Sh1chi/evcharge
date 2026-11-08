@@ -1,0 +1,269 @@
+asyncapi: 3.0.0
+info:
+  title: gateway
+  version: 4.0.0
+  description: Переводит HTTP-запросы клиента в сообщения sessions и stations
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: rabbitmq:5672
+    protocol: amqp
+    protocolVersion: 0.9.1
+
+channels:
+  sessionsCreate:
+    address: sessions.create
+    messages:
+      createRequest:
+        $ref: '#/components/messages/createRequest'
+  sessionsGet:
+    address: sessions.get
+    messages:
+      idRequest:
+        $ref: '#/components/messages/idRequest'
+  sessionsFinish:
+    address: sessions.finish
+    messages:
+      idRequest:
+        $ref: '#/components/messages/idRequest'
+  stationsList:
+    address: stations.list
+    messages:
+      listRequest:
+        $ref: '#/components/messages/listRequest'
+  stationsStatus:
+    address: stations.status
+    messages:
+      statusRequest:
+        $ref: '#/components/messages/statusRequest'
+  reply:
+    address: null
+    description: Временная очередь gateway, создаётся на каждый запрос
+    messages:
+      sessionResponse:
+        $ref: '#/components/messages/sessionResponse'
+      listResponse:
+        $ref: '#/components/messages/listResponse'
+      statusResponse:
+        $ref: '#/components/messages/statusResponse'
+    bindings:
+      amqp:
+        is: queue
+        queue:
+          durable: false
+          exclusive: true
+          autoDelete: true
+
+operations:
+  createSession:
+    action: send
+    channel:
+      $ref: '#/channels/sessionsCreate'
+    summary: POST /api/v1/sessions
+    messages:
+      - $ref: '#/channels/sessionsCreate/messages/createRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  getSession:
+    action: send
+    channel:
+      $ref: '#/channels/sessionsGet'
+    summary: GET /api/v1/sessions/{id}
+    messages:
+      - $ref: '#/channels/sessionsGet/messages/idRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  finishSession:
+    action: send
+    channel:
+      $ref: '#/channels/sessionsFinish'
+    summary: POST /api/v1/sessions/{id}/finish
+    messages:
+      - $ref: '#/channels/sessionsFinish/messages/idRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/sessionResponse'
+  listStations:
+    action: send
+    channel:
+      $ref: '#/channels/stationsList'
+    summary: GET /api/v1/stations?connector=...
+    messages:
+      - $ref: '#/channels/stationsList/messages/listRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/listResponse'
+  setStatus:
+    action: send
+    channel:
+      $ref: '#/channels/stationsStatus'
+    summary: PATCH /api/v1/stations/{id}
+    messages:
+      - $ref: '#/channels/stationsStatus/messages/statusRequest'
+    reply:
+      address:
+        $ref: '#/components/replyAddresses/replyTo'
+      channel:
+        $ref: '#/channels/reply'
+      messages:
+        - $ref: '#/channels/reply/messages/statusResponse'
+
+components:
+  replyAddresses:
+    replyTo:
+      description: Свойство reply_to сообщения AMQP
+      location: $message.header#/replyTo
+
+  correlationIds:
+    correlationId:
+      description: Свойство correlation_id сообщения AMQP
+      location: $message.header#/correlationId
+
+  messages:
+    createRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/createRequest'
+    idRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/idRequest'
+    sessionResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/sessionResponse'
+    listRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/listRequest'
+    listResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/listResponse'
+    statusRequest:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/statusRequest'
+    statusResponse:
+      correlationId:
+        $ref: '#/components/correlationIds/correlationId'
+      payload:
+        $ref: '#/components/schemas/statusResponse'
+
+  schemas:
+    connector:
+      type: string
+      enum: [CCS2, Type2, CHAdeMO]
+    stationStatus:
+      type: string
+      enum: [free, busy]
+
+    createRequest:
+      type: object
+      required: [lat, lon, connector, power_kw]
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+    idRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: integer
+    sessionResponse:
+      type: object
+      properties:
+        session_id:
+          type: integer
+        status:
+          type: string
+          enum: [searching, assigned, not_found, finished]
+        station_id:
+          type: integer
+        error:
+          type: string
+
+    listRequest:
+      type: object
+      properties:
+        connector:
+          type: string
+          description: Пустая строка - все станции
+    station:
+      type: object
+      required: [id, name, lat, lon, connector, power_kw, status]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+        connector:
+          $ref: '#/components/schemas/connector'
+        power_kw:
+          type: number
+        status:
+          $ref: '#/components/schemas/stationStatus'
+    listResponse:
+      type: object
+      required: [stations]
+      properties:
+        stations:
+          type: array
+          items:
+            $ref: '#/components/schemas/station'
+        error:
+          type: string
+
+    statusRequest:
+      type: object
+      required: [station_id, status]
+      properties:
+        station_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/stationStatus'
+    statusResponse:
+      type: object
+      required: [station_id]
+      properties:
+        station_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/stationStatus'
+        error:
+          type: string
