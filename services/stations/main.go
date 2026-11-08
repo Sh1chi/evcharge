@@ -251,15 +251,16 @@ func reply(ch *amqp.Channel, d amqp.Delivery, resp any) {
 
 // возвращает станции с нужным разъёмом или все
 func listStations(db *pgx.Conn, body []byte) listResponse {
+	// пустой срез, чтобы в JSON был [], а не null
+	resp := listResponse{Stations: []station{}}
+
 	var req listRequest
 	err := json.Unmarshal(body, &req)
 	if err != nil {
 		log.Println("не удалось разобрать сообщение:", err)
-		return listResponse{Error: "неверный формат запроса"}
+		resp.Error = "неверный формат запроса"
+		return resp
 	}
-
-	// пустой срез, чтобы в JSON был [], а не null
-	resp := listResponse{Stations: []station{}}
 
 	rows, err := db.Query(context.Background(), selectAll, req.Connector)
 	if err != nil {
