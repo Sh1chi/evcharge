@@ -10,8 +10,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // запрос на поиск станции, присылает sessions
@@ -64,6 +71,26 @@ type statusResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// заголовки сообщения AMQP, через них передаётся контекст трейса
+type headersCarrier amqp.Table
+
+func (c headersCarrier) Get(key string) string {
+	value, _ := c[key].(string)
+	return value
+}
+
+func (c headersCarrier) Set(key, value string) {
+	c[key] = value
+}
+
+func (c headersCarrier) Keys() []string {
+	keys := []string{}
+	for key := range c {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 const selectStations = `
 SELECT id, name, lat, lon FROM stations
 WHERE connector = $1 AND power_kw >= $2 AND status = 'free'`
@@ -77,7 +104,23 @@ const updateStatus = `
 UPDATE stations SET status = $1 WHERE id = $2`
 
 func main() {
-	db, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	// адрес Jaeger и имя сервиса берутся из переменных OTEL_ в compose
+	exp, err := otlptracehttp.New(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	cfg, err := pgx.ParseConfig(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// спан на каждый SQL-запрос, в имени только команда
+	cfg.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
+
+	db, err := pgx.ConnectConfig(context.Background(), cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -135,24 +178,32 @@ func main() {
 				if !ok {
 					return
 				}
-				resp := findStation(db, d.Body)
+				ctx, span := startSpan(d)
+				resp := findStation(ctx, db, d.Body)
 				if resp.Error != "" {
 					log.Printf("сессия %d: %s", resp.SessionID, resp.Error)
 				} else {
 					log.Printf("сессия %d: станция %d, %.1f км",
 						resp.SessionID, resp.StationID, resp.DistanceKM)
 				}
-				reply(ch, d, resp)
+				reply(ctx, ch, d, resp)
+				endSpan(span, resp.Error)
 			case d, ok := <-lists:
 				if !ok {
 					return
 				}
-				reply(ch, d, listStations(db, d.Body))
+				ctx, span := startSpan(d)
+				resp := listStations(ctx, db, d.Body)
+				reply(ctx, ch, d, resp)
+				endSpan(span, resp.Error)
 			case d, ok := <-statuses:
 				if !ok {
 					return
 				}
-				reply(ch, d, setStatus(db, d.Body))
+				ctx, span := startSpan(d)
+				resp := setStatus(ctx, db, d.Body)
+				reply(ctx, ch, d, resp)
+				endSpan(span, resp.Error)
 			}
 		}
 	}()
@@ -164,11 +215,29 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
+	// отправляет в Jaeger спаны, которые ещё не ушли
+	tp.Shutdown(context.Background())
 	log.Println("получен сигнал завершения, сервис остановлен")
 }
 
+// начинает спан обработки сообщения, контекст трейса берёт из заголовков
+func startSpan(d amqp.Delivery) (context.Context, trace.Span) {
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(),
+		headersCarrier(d.Headers))
+	return otel.Tracer("stations").Start(ctx, d.RoutingKey+" process",
+		trace.WithSpanKind(trace.SpanKindConsumer))
+}
+
+// закрывает спан, ответ с ошибкой помечает спан ошибкой
+func endSpan(span trace.Span, errText string) {
+	if errText != "" {
+		span.SetStatus(codes.Error, errText)
+	}
+	span.End()
+}
+
 // ищет ближайшую свободную станцию с нужным разъёмом и мощностью
-func findStation(db *pgx.Conn, body []byte) findResponse {
+func findStation(ctx context.Context, db *pgx.Conn, body []byte) findResponse {
 	var req findRequest
 	err := json.Unmarshal(body, &req)
 	if err != nil {
@@ -178,7 +247,7 @@ func findStation(db *pgx.Conn, body []byte) findResponse {
 
 	resp := findResponse{SessionID: req.SessionID}
 
-	rows, err := db.Query(context.Background(), selectStations,
+	rows, err := db.Query(ctx, selectStations,
 		req.Connector, req.PowerKW)
 	if err != nil {
 		log.Println("не удалось выполнить запрос:", err)
@@ -228,20 +297,25 @@ func distance(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 // отправляет ответ в очередь из reply_to
-func reply(ch *amqp.Channel, d amqp.Delivery, resp any) {
+func reply(ctx context.Context, ch *amqp.Channel, d amqp.Delivery, resp any) {
 	// отвечаем, только если отправитель указал очередь для ответа
 	if d.ReplyTo == "" {
 		return
 	}
 
+	// ответ на поиск sessions обрабатывает дальше, ему нужен контекст трейса
+	headers := amqp.Table{}
+	otel.GetTextMapPropagator().Inject(ctx, headersCarrier(headers))
+
 	body, _ := json.Marshal(resp)
 	msg := amqp.Publishing{
 		ContentType:   "application/json",
 		CorrelationId: d.CorrelationId,
+		Headers:       headers,
 		Body:          body,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	err := ch.PublishWithContext(ctx, "", d.ReplyTo, false, false, msg)
 	if err != nil {
@@ -250,7 +324,7 @@ func reply(ch *amqp.Channel, d amqp.Delivery, resp any) {
 }
 
 // возвращает станции с нужным разъёмом или все
-func listStations(db *pgx.Conn, body []byte) listResponse {
+func listStations(ctx context.Context, db *pgx.Conn, body []byte) listResponse {
 	// пустой срез, чтобы в JSON был [], а не null
 	resp := listResponse{Stations: []station{}}
 
@@ -262,7 +336,7 @@ func listStations(db *pgx.Conn, body []byte) listResponse {
 		return resp
 	}
 
-	rows, err := db.Query(context.Background(), selectAll, req.Connector)
+	rows, err := db.Query(ctx, selectAll, req.Connector)
 	if err != nil {
 		log.Println("не удалось выполнить запрос:", err)
 		resp.Error = "не удалось получить станции"
@@ -285,7 +359,7 @@ func listStations(db *pgx.Conn, body []byte) listResponse {
 }
 
 // меняет статус станции на free или busy
-func setStatus(db *pgx.Conn, body []byte) statusResponse {
+func setStatus(ctx context.Context, db *pgx.Conn, body []byte) statusResponse {
 	var req statusRequest
 	err := json.Unmarshal(body, &req)
 	if err != nil {
@@ -300,7 +374,7 @@ func setStatus(db *pgx.Conn, body []byte) statusResponse {
 		return resp
 	}
 
-	tag, err := db.Exec(context.Background(), updateStatus,
+	tag, err := db.Exec(ctx, updateStatus,
 		req.Status, req.StationID)
 	if err != nil {
 		log.Println("не удалось обновить станцию:", err)
