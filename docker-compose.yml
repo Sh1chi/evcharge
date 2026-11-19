@@ -34,6 +34,12 @@ services:
       timeout: 5s
       retries: 10
 
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    container_name: evcharge-jaeger
+    ports:
+      - "16686:16686"   # веб-интерфейс
+
   sessions:
     build:
       context: .
