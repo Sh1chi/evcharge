@@ -12,6 +12,13 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // тело запроса POST /api/v1/sessions
@@ -43,6 +50,26 @@ type serviceReply struct {
 	Error string `json:"error"`
 }
 
+// заголовки сообщения AMQP, через них передаётся контекст трейса
+type headersCarrier amqp.Table
+
+func (c headersCarrier) Get(key string) string {
+	value, _ := c[key].(string)
+	return value
+}
+
+func (c headersCarrier) Set(key, value string) {
+	c[key] = value
+}
+
+func (c headersCarrier) Keys() []string {
+	keys := []string{}
+	for key := range c {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 var conn *amqp.Connection
 
 // POST /api/v1/sessions
@@ -54,7 +81,7 @@ func createSessionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := call("sessions.create", req)
+	body, err := call(r.Context(), "sessions.create", req)
 	if err != nil {
 		log.Println("нет ответа от sessions:", err)
 		http.Error(w, "сервис сессий не отвечает", http.StatusGatewayTimeout)
@@ -71,7 +98,7 @@ func getSessionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := call("sessions.get", idRequest{SessionID: id})
+	body, err := call(r.Context(), "sessions.get", idRequest{SessionID: id})
 	if err != nil {
 		log.Println("нет ответа от sessions:", err)
 		http.Error(w, "сервис сессий не отвечает", http.StatusGatewayTimeout)
@@ -88,7 +115,7 @@ func finishSessionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := call("sessions.finish", idRequest{SessionID: id})
+	body, err := call(r.Context(), "sessions.finish", idRequest{SessionID: id})
 	if err != nil {
 		log.Println("нет ответа от sessions:", err)
 		http.Error(w, "сервис сессий не отвечает", http.StatusGatewayTimeout)
@@ -101,7 +128,7 @@ func finishSessionHandler(w http.ResponseWriter, r *http.Request) {
 func listStationsHandler(w http.ResponseWriter, r *http.Request) {
 	req := listRequest{Connector: r.URL.Query().Get("connector")}
 
-	body, err := call("stations.list", req)
+	body, err := call(r.Context(), "stations.list", req)
 	if err != nil {
 		log.Println("нет ответа от stations:", err)
 		http.Error(w, "сервис станций не отвечает", http.StatusGatewayTimeout)
@@ -126,7 +153,7 @@ func setStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	req.StationID = id
 
-	body, err := call("stations.status", req)
+	body, err := call(r.Context(), "stations.status", req)
 	if err != nil {
 		log.Println("нет ответа от stations:", err)
 		http.Error(w, "сервис станций не отвечает", http.StatusGatewayTimeout)
@@ -150,7 +177,11 @@ func writeReply(w http.ResponseWriter, body []byte, okCode, errCode int) {
 }
 
 // отправляет запрос в очередь queue и ждёт ответа
-func call(queue string, req any) ([]byte, error) {
+func call(ctx context.Context, queue string, req any) ([]byte, error) {
+	ctx, span := otel.Tracer("gateway").Start(ctx, queue+" send",
+		trace.WithSpanKind(trace.SpanKindProducer))
+	defer span.End()
+
 	ch, err := conn.Channel()
 	if err != nil {
 		return nil, err
@@ -168,16 +199,21 @@ func call(queue string, req any) ([]byte, error) {
 		return nil, err
 	}
 
+	// контекст трейса уходит в заголовках сообщения
+	headers := amqp.Table{}
+	otel.GetTextMapPropagator().Inject(ctx, headersCarrier(headers))
+
 	corrID := strconv.FormatInt(time.Now().UnixNano(), 10)
 	body, _ := json.Marshal(req)
 	msg := amqp.Publishing{
 		ContentType:   "application/json",
 		CorrelationId: corrID,
 		ReplyTo:       q.Name,
+		Headers:       headers,
 		Body:          body,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	err = ch.PublishWithContext(ctx, "", queue, false, false, msg)
@@ -194,13 +230,27 @@ func call(queue string, req any) ([]byte, error) {
 			}
 			return d.Body, nil
 		case <-ctx.Done():
+			span.SetStatus(codes.Error, "нет ответа")
 			return nil, ctx.Err()
 		}
 	}
 }
 
+// имя спана - маршрут, например GET /api/v1/sessions/{id}
+func spanName(operation string, r *http.Request) string {
+	return r.Pattern
+}
+
 func main() {
-	var err error
+	// адрес Jaeger и имя сервиса берутся из переменных OTEL_ в compose
+	exp, err := otlptracehttp.New(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
 	conn, err = amqp.Dial(os.Getenv("AMQP_URL"))
 	if err != nil {
 		log.Fatal(err)
@@ -213,7 +263,10 @@ func main() {
 	http.HandleFunc("GET /api/v1/stations", listStationsHandler)
 	http.HandleFunc("PATCH /api/v1/stations/{id}", setStatusHandler)
 
-	srv := &http.Server{Addr: ":8080"}
+	// спан на каждый HTTP-запрос
+	handler := otelhttp.NewHandler(http.DefaultServeMux, "gateway",
+		otelhttp.WithSpanNameFormatter(spanName))
+	srv := &http.Server{Addr: ":8080", Handler: handler}
 
 	// ListenAndServe не возвращает управление, пока сервер работает
 	go func() {
@@ -231,5 +284,8 @@ func main() {
 
 	log.Println("получен сигнал завершения, закрываем сервер")
 	srv.Shutdown(context.Background())
+
+	// отправляет в Jaeger спаны, которые ещё не ушли
+	tp.Shutdown(context.Background())
 	log.Println("сервер остановлен")
 }

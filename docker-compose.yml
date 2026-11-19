@@ -75,12 +75,16 @@ services:
       # контекст - корень проекта, там лежит go.mod
       context: .
       dockerfile: services/gateway/Dockerfile
-    image: evcharge/gateway:4.0
+    image: evcharge/gateway:5.0
     container_name: evcharge-gateway
     environment:
       AMQP_URL: amqp://evcharge:evcharge@rabbitmq:5672/
+      OTEL_SERVICE_NAME: gateway
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "8080:8080"
     depends_on:
       rabbitmq:
         condition: service_healthy
+      jaeger:
+        condition: service_started
